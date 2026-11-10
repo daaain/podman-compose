@@ -4032,6 +4032,42 @@ async def _validate_completed_successfully(
             raise RuntimeError(error_msg)
 
 
+# Conditions a container that has exited can never meet: `podman wait` on one of them alone blocks
+# forever once the dependency has exited, so the wait also returns when it stops.
+_CONDITIONS_UNMET_ONCE_STOPPED = (
+    ServiceDependencyCondition.RUNNING,
+    ServiceDependencyCondition.HEALTHY,
+    ServiceDependencyCondition.UNHEALTHY,
+)
+
+
+async def _check_not_stopped(
+    compose: PodmanCompose, container_name: str, condition: ServiceDependencyCondition
+) -> None:
+    """After a wait that also returns on stop: fail a health condition the dependency can no
+    longer meet. A started one is met, as in Docker Compose, which doesn't wait on
+    service_started beyond starting the dependency."""
+    output = await compose.podman.output(
+        [], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", container_name]
+    )
+    status, _, exit_code = output.decode().strip().partition(" ")
+    if status not in ("exited", "stopped"):
+        return
+    if condition == ServiceDependencyCondition.RUNNING:
+        log.warning(
+            "Dependency container %s exited (%s); starting its dependents",
+            container_name,
+            exit_code,
+        )
+        return
+    error_msg = (
+        f"Dependency container {container_name} exited ({exit_code}) "
+        f"before becoming {condition.value}"
+    )
+    log.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
 async def check_dep_conditions(compose: PodmanCompose, deps: set) -> None:
     """Enforce that all specified conditions in deps are met"""
     if not deps:
@@ -4073,9 +4109,12 @@ async def check_dep_conditions(compose: PodmanCompose, deps: set) -> None:
                                 ServiceDependencyCondition.UNHEALTHY,
                             ):
                                 await _wait_until_not_created(compose, [d_cnt])
-                            await compose.podman.output(
-                                [], "wait", [f"--condition={condition.value}", d_cnt]
-                            )
+                            conditions = [f"--condition={condition.value}"]
+                            if condition in _CONDITIONS_UNMET_ONCE_STOPPED:
+                                conditions.append("--condition=stopped")
+                            await compose.podman.output([], "wait", [*conditions, d_cnt])
+                            if condition in _CONDITIONS_UNMET_ONCE_STOPPED:
+                                await _check_not_stopped(compose, d_cnt, condition)
                         log.debug(
                             "dependency for condition %s has been fulfilled on container %s",
                             condition.value,

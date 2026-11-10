@@ -110,7 +110,7 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             wait_calls,
             [
-                ([], "wait", ["--condition=running", "cnt_b"]),
+                ([], "wait", ["--condition=running", "--condition=stopped", "cnt_b"]),
                 ([], "wait", ["--condition=stopped", "cnt_a"]),
             ],
         )
@@ -137,6 +137,66 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
         await check_dep_conditions(compose, deps)
 
         self.assertGreater(compose.podman.output.call_count, 1)
+
+    @parameterized.expand([
+        ("service_healthy", "healthy"),
+        ("unhealthy", "unhealthy"),
+    ])
+    async def test_health_dependency_that_exits_fails_instead_of_waiting_forever(
+        self, condition: str, podman_condition: str
+    ) -> None:
+        """podman wait --condition=healthy never returns once the container has exited"""
+        compose = mock.Mock()
+        compose.podman.output = mock.AsyncMock()
+        compose.podman.output.side_effect = [
+            b"running",  # inspect poll: dependency started
+            b"",  # podman wait: returns on the stopped condition
+            b"exited 1",  # inspect after the wait
+        ]
+        compose.podman_version = None
+        compose.container_names_by_service = {
+            "srva": ["cnt_a"],
+        }
+        deps = {
+            ServiceDependency("srva", condition),
+        }
+
+        with self.assertRaisesRegex(RuntimeError, r"^Dependency container cnt_a exited \(1\)"):
+            await check_dep_conditions(compose, deps)
+
+        calls = [c.args for c in compose.podman.output.call_args_list]
+        self.assertIn(
+            ([], "wait", [f"--condition={podman_condition}", "--condition=stopped", "cnt_a"]),
+            calls,
+        )
+
+    async def test_started_dependency_that_exits_does_not_block_dependents(self) -> None:
+        """Docker Compose doesn't wait on service_started beyond starting the dependency, so a
+        dependency that has already exited satisfies it rather than blocking forever"""
+        compose = mock.Mock()
+        compose.podman.output = mock.AsyncMock()
+        compose.podman.output.side_effect = [
+            b"",  # podman wait: returns on the stopped condition
+            b"exited 1",  # inspect after the wait
+        ]
+        compose.podman_version = None
+        compose.container_names_by_service = {
+            "srva": ["cnt_a"],
+        }
+        deps = {
+            ServiceDependency("srva", "service_started"),
+        }
+
+        with self.assertLogs("podman_compose", level="WARNING") as logs:
+            await check_dep_conditions(compose, deps)
+
+        self.assertEqual(
+            logs.output,
+            [
+                "WARNING:podman_compose:Dependency container cnt_a exited (1); "
+                "starting its dependents"
+            ],
+        )
 
     async def test_skips_healthy_below_4_6_0(self) -> None:
         """Healthcheck condition is skipped on podman < 4.6.0"""
@@ -189,7 +249,8 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             calls,
             [
                 ([], "inspect", ["--format={{.State.Status}}", "cnt_a"]),
-                ([], "wait", ["--condition=healthy", "cnt_a"]),
+                ([], "wait", ["--condition=healthy", "--condition=stopped", "cnt_a"]),
+                ([], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", "cnt_a"]),
             ],
         )
 
@@ -213,7 +274,8 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             calls,
             [
                 ([], "inspect", ["--format={{.State.Status}}", "cnt_a"]),
-                ([], "wait", ["--condition=healthy", "cnt_a"]),
+                ([], "wait", ["--condition=healthy", "--condition=stopped", "cnt_a"]),
+                ([], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", "cnt_a"]),
             ],
         )
 
@@ -227,6 +289,7 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             b"created",  # inspect poll: still not started
             b"running",  # inspect poll: dependency started
             b"",  # podman wait
+            b"running 0",  # inspect after the wait: it's running
         ]
         compose.podman_version = None
         compose.container_names_by_service = {
@@ -246,7 +309,8 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
                 inspect_call,
                 inspect_call,
                 inspect_call,
-                ([], "wait", ["--condition=healthy", "cnt_a"]),
+                ([], "wait", ["--condition=healthy", "--condition=stopped", "cnt_a"]),
+                ([], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", "cnt_a"]),
             ],
         )
 
@@ -257,6 +321,7 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             b"created",  # inspect poll: dependency not started yet
             b"running",  # inspect poll: dependency started
             b"",  # podman wait
+            b"running 0",  # inspect after the wait: it's running
         ]
         compose.podman_version = None
         compose.container_names_by_service = {
@@ -275,14 +340,15 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             [
                 inspect_call,
                 inspect_call,
-                ([], "wait", ["--condition=unhealthy", "cnt_a"]),
+                ([], "wait", ["--condition=unhealthy", "--condition=stopped", "cnt_a"]),
+                ([], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", "cnt_a"]),
             ],
         )
 
     async def test_started_does_not_poll_for_created_state(self) -> None:
         """service_started maps to podman wait --condition=running, which is not affected"""
         compose = mock.Mock()
-        compose.podman.output = mock.AsyncMock()
+        compose.podman.output = mock.AsyncMock(return_value=b"running 0")
         compose.podman_version = None
         compose.container_names_by_service = {
             "srva": ["cnt_a"],
@@ -294,4 +360,10 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
         await check_dep_conditions(compose, deps)
 
         calls = [c.args for c in compose.podman.output.call_args_list]
-        self.assertEqual(calls, [([], "wait", ["--condition=running", "cnt_a"])])
+        self.assertEqual(
+            calls,
+            [
+                ([], "wait", ["--condition=running", "--condition=stopped", "cnt_a"]),
+                ([], "inspect", ["--format={{.State.Status}} {{.State.ExitCode}}", "cnt_a"]),
+            ],
+        )

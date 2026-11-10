@@ -353,6 +353,73 @@ class TestComposeConditionalDeps(unittest.TestCase, RunSubprocessMixin):
                 "0",
             ])
 
+    @unittest.skipIf(
+        get_podman_version() < version.parse("4.6.0"),
+        "podman wait --condition=healthy not supported below 4.6.0.",
+    )
+    def test_deps_healthy_dependency_exits_fails(self) -> None:
+        suffix = "-conditional-exited-healthy"
+        try:
+            _, stderr = self.run_subprocess_assert_returncode(
+                [
+                    podman_compose_path(),
+                    "-f",
+                    compose_yaml_path(suffix),
+                    "up",
+                    "-d",
+                ],
+                1,
+                timeout=60,
+            )
+            self.assertIn(
+                b"Dependency container deps_exits_1 exited (3) before becoming healthy", stderr
+            )
+        finally:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "down",
+                "-t",
+                "0",
+            ])
+
+    def test_deps_started_dependency_exits_starts_dependents(self) -> None:
+        suffix = "-conditional-exited-started"
+        try:
+            _, stderr = self.run_subprocess_assert_returncode(
+                [
+                    podman_compose_path(),
+                    "-f",
+                    compose_yaml_path(suffix),
+                    "up",
+                    "-d",
+                ],
+                timeout=60,
+            )
+            self.assertIn(b"Dependency container deps_exits_1 exited (3)", stderr)
+            output, _ = self.run_subprocess_assert_returncode([
+                "podman",
+                "ps",
+                "-a",
+                "--filter",
+                "name=deps_",
+                "--format",
+                "json",
+            ])
+            by_name = {c["Names"][0]: c for c in json.loads(output)}
+            self.assertEqual(by_name["deps_exits_1"]["State"], "exited")
+            self.assertEqual(by_name["deps_should_start_1"]["State"], "running")
+        finally:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "down",
+                "-t",
+                "0",
+            ])
+
 
 class TestComposeConditionalDepsHealthy(unittest.TestCase, PodmanAwareRunSubprocessMixin):
     def setUp(self) -> None:

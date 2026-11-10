@@ -1,0 +1,11 @@
+version: "3.7"
+services:
+  exits:
+    image: nopush/podman-compose-test
+    command: ["sh", "-c", "exit 3"]
+  should_start:
+    image: nopush/podman-compose-test
+    command: ["sh", "-c", "sleep 3600"]
+    depends_on:
+      exits:
+        condition: service_started

@@ -1,0 +1,1 @@
+`up` no longer waits forever for a dependency that has exited: `service_healthy` (and `unhealthy`) now fails with the dependency's exit code, and `service_started` starts the dependents, as Docker Compose does.
